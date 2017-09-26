@@ -6,7 +6,7 @@ setup(
    'pandas>=0.18.0',
    'numpy'
 ],
-  version = '0.1',
+  version = '0.1.1',
   description = 'Recommender system based on parameterized Item-Item effects',
   author = 'David Cortes',
   author_email = 'david.cortes.rivera@gmail.com',

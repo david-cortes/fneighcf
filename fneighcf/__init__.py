@@ -90,6 +90,9 @@ class FNeigh:
             del self._ratings_df['user_bias']
         else:
             avg_rating_by_user=self._ratings_df.groupby('UserId')['Rating'].mean().to_frame().rename(columns={'Rating':"AvgUserRating"})
+            self._global_bias=0.0
+            self._item_bias=pd.Series([0.0]*self.nitems)
+            self._user_bias=avg_rating_by_user.AvgUserRating
             self._ratings_df=pd.merge(self._ratings_df,avg_rating_by_user,left_on='UserId',right_index=True,how='left')
             self._ratings_df['dev']=self._ratings_df.Rating-self._ratings_df.AvgUserRating
             
@@ -106,6 +109,7 @@ class FNeigh:
         
         self.err_track.append((self._ratings_df.err**2).mean())
         if verbose:
+            print('Iteration',str(iteration+1))
             print('RMSE before update: ',self.err_track[-1])
             print('')
             
@@ -367,7 +371,7 @@ class FNeigh:
         ratings=ratings.loc[~ratings.ItemId.isnull()].sort_values('ItemId')
         rated_items=list(ratings.ItemId)
         if len(rated_items)<2:
-            warnings.warn('Fewer than two of the items rated had parameters in the model. Recommending most popular items.')
+            warnings.warn('Fewer than two of the items rated had parameters in the model.')
             return self._item_bias[self._item_int_to_orig[itemId]]
         
         # calculating the score
