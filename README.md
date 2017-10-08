@@ -36,7 +36,7 @@ Note that the regularization parameters and step sizes used can make a huge diff
 A more detailed example with the MovieLens data can be found [in this IPython notebook](http://nbviewer.jupyter.org/github/david-cortes/fneighcf/blob/master/example/fneighcf_example.ipynb), and docstrings are available for internal documentation (e.g. ```?FNeight.fit```).
 
 ## Implementation Notes
-This is a pure python implementation of the algorithm, so fitting the model will be slow for larger datasets. The code quality is research-grade. As a point of reference, one gradient descent iteration over the movielens-100k takes around 5 minutes on a regular computer, while an iteration over the movielens-1M takes around 1 hour. Making recommendations from the model is fast though.
+This is a pure python implementation of the algorithm, so fitting the model will be slow for large datasets. The code quality is research-grade. As a point of reference, one gradient descent iteration over the movielens-100k takes around 5 minutes on a regular computer, while an iteration over the movielens-1M takes around 1 hour. Making recommendations from the model is fast though.
 
 User and item biases are started with a simple heuristic:
 ```

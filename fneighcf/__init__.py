@@ -101,15 +101,16 @@ class FNeigh:
             self._ratings_df['dev']=self._ratings_df.Rating-self._ratings_df.apply(lambda x: self._user_bias[x['UserId']]+self._item_bias[x['ItemId']],axis=1)
             if verbose:
                 print('Iteration',str(iteration+1))
-                print('RMSE after biases only:',self._ratings_df.dev.map(lambda x: x**2).mean())
+                print('RMSE after biases only:',np.sqrt(self._ratings_df.dev.map(lambda x: x**2).mean()))
 
         self._ratings_df['implicit']=self._ratings_df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions_passive[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]),axis=1)
         self._ratings_df['explicit']=self._ratings_df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]*self._ratings_df.dev.loc[self._indexes_per_user[x['UserId']]]),axis=1)
         self._ratings_df['err']=self._ratings_df.dev-self._ratings_df.implicit-self._ratings_df.explicit
         
-        self.err_track.append((self._ratings_df.err**2).mean())
+        self.err_track.append(np.sqrt((self._ratings_df.err**2).mean()))
         if verbose:
-            print('Iteration',str(iteration+1))
+            if not self._use_biases:
+                print('Iteration',str(iteration+1))
             print('RMSE before update: ',self.err_track[-1])
             print('')
             
