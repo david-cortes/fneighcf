@@ -27,7 +27,7 @@ Package is available on PyPI, can be installed with
 
 ## Usage
 
-```
+``` python
 import pandas as pd
 from fneighcf import FNeigh
 
