@@ -1,607 +1,563 @@
-import pandas as pd, numpy as np, warnings
+import cython_loops, numpy as np, pandas as pd
+from scipy.optimize import minimize
+import warnings
 
 class FNeigh:
-    """Recommender system based on parameterized Item-Item effects.
-    
+    """
+    Factorized Neighborhood Model
+
     Note
     ----
-    All users and items are reindexed internally, so you can use non-integer IDs and don't have to worry about enumeration gaps.
-    
-    The model parameters are estimated using gradient descent (can also use stochastic gradient descent if desired).
-    The objective function doesn't standardize the rating prediction error according to the number of ratings,
-    thus the regularization parameters need to be set to larger numbers for larger datasets.
+    This package only supports the full model version, with all possible
+    item-item effects and full square matrices rather than smaller latent
+    factor triplets.
 
     Parameters
     ----------
-    use_biases : bool
-        Whether the model should use user and item rating biases as parameters.
-        If set to False, the ratings are centered by subtracting the mean rating from each user.
-        If set to True, the ratings are centered by subtracting the global mean and the user and item bias,
-        which become model parameters.
-        Setting it to false results in final recommendations for users being more varied.
-    norm_nratings : float
-        Normalization parameter for the number of ratings per user.
-        Setting it to zero means no normalization by number of ratings.
-    reg_param_biases : float
-        Regularization parameter for the user and item biases in the model. Ignored when use_biases=False.
-    reg_param_interactions : float
-        Regularization parameter for the item interaction parameters in the model.
-    save_ratings : bool
-        Whether the model should store the ratings used to construct it.
-        Allows for faster computation of recommendations for existing users.
+    center_ratings : bool
+        Whether to subtract the global mean from the ratings
+    alpha : float
+        Parameter for weighting according to the number of ratings from each user
+    lambda_bu : int or float
+        Regularization for calculating the fixed user biases
+    lambda_bi : int or float
+        Regularization for calculating the fixed item biases
+    lambda_u : float
+        Regularization for the variable user biases (model parameters)
+    lambda_i : float
+        Regularization for the variable item biases (model parameters)
+    lambda_W : float
+        Regularization for the item-item effects on rating deviations
+    lambda_C : float
+        Regularization for the implicit item-item effects
+
+    Attributes
+    ----------
+    user_dict : dict
+        Mapping from user IDs as passed in the data to position in the model parameters
+    item_dict : dict
+        Mapping from item IDs as passed in the data to position in the model parameters
+    is_fitted : bool
+        Indicator telling whether the model has been fit to some data
+    W_ : array (n_items**2)
+        Model coefficients for rating deviations (flattened - reshape as (N_items, N_items) for further use)
+    C_ : array (n_items**2)
+        Model coefficients for implicit effects (flattened - reshape as (N_items, N_items) for further use)
+    bu_ : array (n_users,)
+        Model coefficients for variable user bias
+    bi_ : array (n_items,)
+        Model coefficients for variable item bias
+    bias_user_fixed : array (n_users,)
+        Fixed user bias (used to calculate deviations)    
+    bias_item_fixed : array (n_items,)
+        Fixed item bias (used to calculate deviations)
+
+    References
+    ----------
+    * Factor in the neighbors: Scalable and accurate collaborative filtering (Koren, Y. 2010)
     """
+    def __init__(self, center_ratings=True, alpha=0.5, lambda_bu=10, lambda_bi=25,
+                 lambda_u=5e-1, lambda_i=5e-2, lambda_W=5e-3, lambda_C=5e-2):
+        
+        ## checking input
+        assert (isinstance(alpha, float) or isinstance(alpha, int))
+        assert (isinstance(lambda_bu, float) or isinstance(lambda_bu, int))
+        assert (isinstance(lambda_bi, float) or isinstance(lambda_bi, int))
+        assert isinstance(lambda_u, float)
+        assert isinstance(lambda_i, float)
+        assert isinstance(lambda_W, float)
+        assert isinstance(lambda_C, float)
+        assert isinstance(center_ratings, bool)
+        
+        ## remembering parameters
+        self.center_ratings = center_ratings
+        self.alpha = alpha
+        self.lambda_bu = lambda_bu
+        self.lambda_bi = lambda_bi
+        self.lambda_u = lambda_u
+        self.lambda_i = lambda_i
+        self.lambda_W = lambda_W
+        self.lambda_C = lambda_C
+        
+        ## data to fill in later
+        self.user_dict = None
+        self.item_dict = None
+        
+        self.is_fitted = False
+        
+        ## model parameters
+        self.W_ = None
+        self.C_ = None
+        self.bu_ = None
+        self.bi_ = None
+        self.bias_item_fixed = None
+        self.bias_user_fixed = None
     
-    def __init__(self, use_biases=True,norm_nratings=-0.5, reg_param_biases=1e-3, reg_param_interactions=1e-1, save_ratings=True):
-        self._use_biases=use_biases
-        self._reg_param_biases=reg_param_biases
-        self._reg_param_interactions=reg_param_interactions
-        self._norm_nratings=norm_nratings
-        self._save_ratings=save_ratings
-    
-    def _create_df(self,ratings):
-        self._user_orig_to_int=dict()
-        self._item_orig_to_int=dict()
-        self._item_int_to_orig=dict()
-        
-        if type(ratings)==list:
-            self._ratings_df=pd.DataFrame(ratings,columns=['UserId','ItemId','Rating'])
-        elif type(ratings)==pd.core.frame.DataFrame:
-            if ('UserId' not in ratings.columns.values) or ('ItemId' not in ratings.columns.values) or ('Rating' not in ratings.columns.values):
-                raise ValueError("Ratings data frame must contain the columns 'UserId','ItemId' and 'Rating'")
-            self._ratings_df=ratings[['UserId','ItemId','Rating']].copy()
-        else:
-            raise ValueError("Ratings must be a list of tuples or pandas data frame")
-            
-        cnt_users=0
-        cnt_items=0
-        for i in self._ratings_df.itertuples():
-            if i.UserId not in self._user_orig_to_int:
-                self._user_orig_to_int[i.UserId]=cnt_users
-                cnt_users+=1
-            if i.ItemId not in self._item_orig_to_int:
-                self._item_orig_to_int[i.ItemId]=cnt_items
-                self._item_int_to_orig[cnt_items]=i.ItemId
-                cnt_items+=1
-                
-        self._ratings_df['UserId']=self._ratings_df.UserId.map(lambda x: self._user_orig_to_int[x])
-        self._ratings_df['ItemId']=self._ratings_df.ItemId.map(lambda x: self._item_orig_to_int[x])
-        self._ratings_df=self._ratings_df.reset_index(drop=True)
-        
-        self.nusers=cnt_users
-        self.nitems=cnt_items
-    
-    def _initiate_parameters(self,ratings_df):
-        nratings_per_user=ratings_df.groupby('UserId')['Rating'].count()
-        self._rating_norm_per_user=(nratings_per_user**(self._norm_nratings))
-        self._items_rated_per_user=ratings_df.groupby('UserId')['ItemId'].aggregate(lambda x: list(x))
-        self._indexes_per_user=ratings_df.groupby('UserId')['ItemId'].aggregate(lambda x: list(x.index))
-        self.err_track=list()
-        
-        self._item_interactions=np.zeros((self.nitems,self.nitems))
-        self._item_interactions_passive=np.zeros((self.nitems,self.nitems))
-        
-        if self._use_biases:
-            self._global_bias=ratings_df.Rating.mean()
-            self._ratings_df['dev']=self._ratings_df.Rating-self._global_bias
-            self._user_bias=self._ratings_df.groupby('UserId')['dev'].mean()
-            self._ratings_df=pd.merge(self._ratings_df,self._user_bias.to_frame().rename(columns={'dev':'user_bias'}),left_on='UserId',right_index=True,how='left')
-            self._ratings_df['dev']=self._ratings_df.Rating-self._global_bias-self._ratings_df.user_bias
-            self._item_bias=self._ratings_df.groupby('ItemId')['dev'].mean()
-            del self._ratings_df['user_bias']
-        else:
-            avg_rating_by_user=self._ratings_df.groupby('UserId')['Rating'].mean().to_frame().rename(columns={'Rating':"AvgUserRating"})
-            self._global_bias=0.0
-            self._item_bias=pd.Series([0.0]*self.nitems)
-            self._user_bias=avg_rating_by_user.AvgUserRating
-            self._ratings_df=pd.merge(self._ratings_df,avg_rating_by_user,left_on='UserId',right_index=True,how='left')
-            self._ratings_df['dev']=self._ratings_df.Rating-self._ratings_df.AvgUserRating
-            
-    def _calculate_errors(self,verbose=False,iteration=None):
-        if self._use_biases:
-            self._ratings_df['dev']=self._ratings_df.Rating-self._ratings_df.apply(lambda x: self._user_bias[x['UserId']]+self._item_bias[x['ItemId']],axis=1)
-            if verbose:
-                print('Iteration',str(iteration+1))
-                print('RMSE after biases only:',np.sqrt(self._ratings_df.dev.map(lambda x: x**2).mean()))
-
-        self._ratings_df['implicit']=self._ratings_df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions_passive[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]),axis=1)
-        self._ratings_df['explicit']=self._ratings_df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]*self._ratings_df.dev.loc[self._indexes_per_user[x['UserId']]]),axis=1)
-        self._ratings_df['err']=self._ratings_df.dev-self._ratings_df.implicit-self._ratings_df.explicit
-        
-        self.err_track.append(np.sqrt((self._ratings_df.err**2).mean()))
-        if verbose:
-            if not self._use_biases:
-                print('Iteration',str(iteration+1))
-            print('RMSE before update: ',self.err_track[-1])
-            print('')
-            
-    def _update_step_sizes(self,iteration,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt):
-        if decrease_step_sqrt:
-            step_size_biases=step_size_biases/np.sqrt(iteration+2)
-            step_size_interactions=step_size_interactions/np.sqrt(iteration+2)
-        elif decrease_step_frac:
-            step_size_biases*=decrease_step_frac
-            step_size_interactions*=decrease_step_frac
-            
-        return step_size_biases,step_size_interactions
-
-
-    def _sgd_fit_w_biases(self,maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt):
-        for iteration in range(maxiter):
-            for i in self._ratings_df.sample(frac=1).itertuples():
-                ###### calculating errors
-                deviations=(self._ratings_df.Rating[self._indexes_per_user[i.UserId]]-self._user_bias[i.UserId]-self._item_bias[i.ItemId]).values.reshape(-1)
-                implicit_eff=self._rating_norm_per_user[i.UserId]*np.sum(self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]]*deviations)
-                explicit_eff=self._rating_norm_per_user[i.UserId]*np.sum(self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]])
-                err=i.Rating-self._user_bias[i.UserId]-self._item_bias[i.ItemId]-implicit_eff-explicit_eff
-
-                ###### updating parameters
-                self._user_bias+=step_size_biases*(err-self._reg_param_biases*self._user_bias)
-                self._item_bias+=step_size_biases*(err-self._reg_param_biases*self._item_bias)
-                self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]]+=step_size_interactions*(self._rating_norm_per_user[i.UserId]*err*deviations-self._reg_param_interactions*self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]])
-                self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]]+=step_size_interactions*(self._rating_norm_per_user[i.UserId]*err-self._reg_param_interactions*self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]])
-
-                self._item_interactions[i.ItemId,i.ItemId]=0
-                self._item_interactions_passive[i.ItemId,i.ItemId]=0
-
-        step_size_biases,step_size_interactions=self._update_step_sizes(iteration,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt)
-
-    
-    def _sgd_fit_wo_biases(self,maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt):
-        for iteration in range(maxiter):
-            for i in self._ratings_df.sample(frac=1).itertuples():
-                ###### calculating errors
-                deviations=(self._ratings_df.dev.loc[self._indexes_per_user[i.UserId]]).values.reshape(1,-1)
-                implicit_eff=self._rating_norm_per_user[i.UserId]*np.sum(self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]]*deviations)
-                explicit_eff=self._rating_norm_per_user[i.UserId]*np.sum(self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]])
-                err=i.dev-implicit_eff-explicit_eff
-
-                ###### updating parameters
-                self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]]+=step_size_interactions*(self._rating_norm_per_user[i.UserId]*err*deviations-self._reg_param_interactions*self._item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]])
-                self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]]+=step_size_interactions*(self._rating_norm_per_user[i.UserId]*err-self._reg_param_interactions*self._item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]])
-
-                self._item_interactions[i.ItemId,i.ItemId]=0
-                self._item_interactions_passive[i.ItemId,i.ItemId]=0
-
-        step_size_biases,step_size_interactions=self._update_step_sizes(iteration,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt)
-    
-    def _gd_fit(self,maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt,verbose):
-        for iteration in range(maxiter):
-            
-            ####### getting errors and checking stopping criterion
-            self._calculate_errors(verbose,iteration)
-            if len(self.err_track)>2:
-                if self.err_track[-1]>=1.01*self.err_track[-2]:
-                    warnings.warn("RMSE increased after gradient descent iteration, stopping optimization. Try decreasing the step sizes and/or adjusting the regularization parameters")
-                    break
-                if self.err_track[-1]>=.995*self.err_track[-2]:
-                    break
-
-            ####### parameters to update
-            if self._use_biases:
-                update_user_bias=self._ratings_df.groupby('UserId')['err'].sum()
-                update_item_bias=self._ratings_df.groupby('ItemId')['err'].sum()
-            update_item_interactions=np.zeros_like(self._item_interactions)
-            update_item_interactions_passive=np.zeros_like(self._item_interactions_passive)
-
-            ####### looped gradient calculation
-            for i in self._ratings_df.itertuples():
-                update_item_interactions[i.ItemId,self._items_rated_per_user[i.UserId]]+=self._rating_norm_per_user[i.UserId]*i.err*self._ratings_df.dev.loc[self._indexes_per_user[i.UserId]]
-                update_item_interactions_passive[i.ItemId,self._items_rated_per_user[i.UserId]]+=self._rating_norm_per_user[i.UserId]*i.err
-
-            ####### updating parameters
-            if self._use_biases:
-                self._user_bias+=step_size_biases*(update_user_bias-self._reg_param_biases*self._user_bias)
-                self._item_bias+=step_size_biases*(update_item_bias-self._reg_param_biases*self._item_bias)
-            self._item_interactions+=step_size_interactions*(update_item_interactions-self._reg_param_interactions*self._item_interactions)
-            self._item_interactions_passive+=step_size_interactions*(update_item_interactions_passive-self._reg_param_interactions*self._item_interactions_passive)
-
-            np.fill_diagonal(self._item_interactions,0)
-            np.fill_diagonal(self._item_interactions_passive,0)
-            step_size_biases,step_size_interactions=self._update_step_sizes(iteration,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt)
-    
-    def fit(self, ratings, maxiter=10, step_size_biases=1e-3, step_size_interactions=1e-2,
-            decrease_step_frac=0.9, decrease_step_sqrt=True, use_sgd=False,verbose=False):
-        """Fit a model to ratings data.
-
-        Note
-        ----
-        Step sizes might require a lot of manual tuning depending on the specific data used and the size of the data.
-        
-        This is a pure python implementation, so fitting the model can get quite slow.
-        As a reference point, on a regular desktop computer, it takes about 5 minutes to run one gradient descent update
-        on the movielens-100k dataset, and about 1 hour to run one iteration over the movielens-1M.
-        
-        For larger datasets, it's recommended to switch to stochastic gradient descent instead (use_sgd=True),
-        as it will require fewer passes over the data to converge.
-
-        Parameters
-        ----------
-        ratings : data frame or list of tuples
-            Ratings data to build the model.
-            If a data frame is passed, it must contain the columns 'UserId','ItemId' and 'Rating'.
-            If a list of tuples is passed, tuples must be in the format (UserId,ItemId,Rating)
-        maxiter : int
-            Maximum number of iterations. Will terminate earlier if the RMSE decreases too little.
-            Larger data sets require fewer iterations than smaller ones.
-        step_size_biases : float
-            Step size for gradient descent updates of model biases.
-            Ignored if the model was called with use_biases=False.
-            Can also be set to zero to define biases with a heuristic, thus not becoming model parameters.
-            This last option might make recommendations better when using more ratings that were not in the training data.
-        step_size_interactions : float
-            Step size for gradient descent updates of item interaction parameters.
-        decrease_step_frac: float
-            Fraction by which the step sizes will be reduced for each next iteration.
-            Setting it to 1 means constant step sizes.
-        decrease_step_sqrt: bool
-            Whether to use, at each iteration, a step size equal to value/sqrt(iteration).
-            'decrease_step_frac' is ignored when this is set to 'True'.
-        use_sgd: bool
-            If set to true, the model parameters will be updated immediately after iterating over each row.
-            Recommended to adjust step sizes and regularization parameters when trying this approach.
-        verbose: bool
-            Whether to print the RMSE after each iteration. Not available when using stochastic gradient descent.
+    def fit(self, ratings_df, method='lbfgs', opts_lbfgs={'maxiter':300},
+            epochs=100, step_size=5e-3, decrease_step=True, early_stop=True, random_seed=None,
+            save_data=True, verbose=False):
         """
-        self._create_df(ratings)
-        self._initiate_parameters(self._ratings_df)
-        
-        if self._use_biases:
-            self._ratings_df['Rating']-=self._global_bias
-        else:
-            if verbose and not use_sgd:
-                print('RMSE of null model: ',(self._ratings_df.Rating**2).mean())
-                print('')
-            
-        if not use_sgd:
-            self._gd_fit(maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt,verbose)
-        else:
-            if self._use_biases:
-                self._sgd_fit_w_biases(maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt)
-            else:
-                self._sgd_fit_wo_biases(maxiter,step_size_biases,step_size_interactions,decrease_step_frac,decrease_step_sqrt)
-            
-        if not self._save_ratings:
-            del self._indexes_per_user
-            del self._items_rated_per_user
-            del self._rating_norm_per_user
-            del self._ratings_df
-        else:
-            if self._use_biases:
-                self._ratings_df['Rating']+=self._global_bias
-    
-    def predict(self,user,item):
-        """Predict what rating would a user give to an item.
+        Fits the model to explicit ratings data
 
         Note
         ----
-        If you saved the ratings into the model and wish to do faster predictions over a list, use the 'predict_list' method.
-        Function only available for existing users, and only if the ratings were saved into the model.
-        The 'top_n' function with 'scores=True' can be used for faster recommended lists.
+        The model allows fitting using L-BFGS-B, which calculates the full gradient
+        and objective function in order to update the parameters at each iteration,
+        and using SGD, which iterates through the data updating the parameters right after
+        processing each individual rating.
+
+        SGD has lower memory requirements and is able to achieve a low error in
+        less time, but it likely won't reach the optimal solution and requires tuning
+        the step size and other parameters. This  is likely an appropriate alternative for
+        large datasets.
+
+        L-BFGS-B requires more memory, and is slower to converge, but it always reaches
+        the optimal solution and doesn't require playing with parameters like the step size.
+        Recommended for smaller datasets.
+
+        You can store the training data in the model object, which allows for faster
+        recomendations for the users in the training data, and for predictions on a test set.
+        Otherwise, it can only produce top-N recomended lists, as it doesn't have the user
+        biases needed for a full rating prediction.
 
         Parameters
         ----------
-        user
-            User for which to make a prediction.
-        item
-            Item for which to predict a rating.
+        ratings_df : data frame or array (n_ratings, 3)
+            Ratings data, including which users rated which items as how good.
+            If an array, will assume that the columns are in this order: Rating, User, Item
+            If a data frame, must have columns named 'Rating', 'UserId', 'ItemId'
+        method : str
+            One of 'lbfgs' or 'sgd'
+        opts_lbfgs : dict
+            Additional options to pass to L-BFGS-B (see SciPy's minimize documentation)
+        epochs : int
+            (Only for SGD) Maximum number of epochs
+        step_size : float
+            (Only for SGD) Step size for parameter updates
+        decrease_step : bool
+            (Only for SGD) Whether to decrease step sizes after each iteration (see Note)
+        early_stop : bool
+            (Only for SGD) Whether to stop if the error reduction is too small after an epoch
+        random_seed : None or int
+            (Only for SGD) Random seed to use when shuffling the data at the beginning of each epoch
+        save_data : bool
+            Whether to store the training data in the model object.
+            You'll need this if you want to make predictions on a test set,
+            or if you want to make faster recomendations for users in the training data
+        verbose : bool
+            Whether to print convergence messages after each iteration/epoch.
+            If running on an IPython notebook, for L-BFGS-B it will print on the console
+            but not on the notebook (this comes from SciPy's implementation)
 
         Returns
         -------
-        float
-            Rating predicted by the model.
+        self : obj
+            Copy of this same object
         """
-        if user in self._user_orig_to_int:
-            userId=self._user_orig_to_int[user]
+        
+        ## checking input
+        if method == 'SGD':
+            method = 'sgd'
+        if (method == 'L-BFGS') or (method == 'LBFGS') or (method == 'L-BFGS-B'):
+            method = 'lbfgs'
+        assert (method == 'sgd') or (method == 'lbfgs')
+        if epochs is not None:
+            assert isinstance(epochs, int)
+            assert epochs>0
+        if step_size is not None:
+            assert isinstance(step_size, float)
+            
+        assert isinstance(save_data, bool)
+        assert isinstance(verbose, bool)
+        
+        self._process_data(ratings_df)
+        del ratings_df
+        self._calculate_initial_params()
+        
+        if method == 'sgd':
+            self._fit_sgd(step_size, epochs,
+                          decrease_step, early_stop,
+                          random_seed, verbose)
         else:
-            raise ValueError('Invalid User')
+            self._fit_lbfgs(opts_lbfgs, verbose)
             
-        if item in self._item_orig_to_int:
-            itemId=self._item_orig_to_int[item]
+        self.save_data = save_data
+        if self.save_data:
+            pass
         else:
-            raise ValueError('Invalid Item')
+            del self._traindata
+            del self._n_rated_by_user
+            del self._st_ix_user
             
-        try:
-            temp=self._ratings_df.Rating.loc[0]
-        except:
-            raise ValueError("'predict' only available when the ratings are saved in the model")
-            
-        return self._global_bias+self._user_bias[userId]+self._item_bias[itemId]+self._rating_norm_per_user[userId]*np.sum(self._item_interactions[itemId,self._items_rated_per_user[userId]]*self._ratings_df.dev.loc[self._indexes_per_user[userId]])+self._rating_norm_per_user[userId]*np.sum(self._item_interactions_passive[itemId,self._items_rated_per_user[userId]])
+        self.is_fitted = True
+        return self
     
-    def score(self,rating_history,item,user=None,use_item_bias=True):
-        """Get the score a user give to an item. Similar to 'predict', but without adding user bias and global bias
-        (thus the ranking of items by their predicted score is the same, but the predicted scores are not reflective of actual scores).
-
-        Note
-        ----
-        If you saved the ratings into the model and wish to do faster predictions over a list, use the 'predict_list' method.
-        Function only available for existing users, and only if the ratings were saved into the model.
-        The 'top_n' function with 'scores=True' can be used for faster recommended lists.
-
-        Parameters
-        ----------
-        rating_history: list of tuples, dict, or data frame
-            Rating history of the user.
-            If a list, must contain tuples in the format (ItemId,Rating).
-            If a dict, must contain entries in the format {ItemId:Rating}.
-            If a data frame, must contain columns 'ItemId','Rating'.
-            If passing an empty list or only 1 element, will recommend the most popular items.
-            Ratings for items that were not in the training set will be ignored.
-        item
-            Item for which to predict a rating.
-        user
-            User for which to make a prediction.
-            If set to None, the user bias will be calculated as mean(Rating-global_bias) from the ratings provided here.
-        use_item_bias: bool
-            Whether to include the item bias (favoring overall better-rated items) when predicting ratings.
-            Recommendations that don't take this into account are more diverse and more customized for each user,
-            but overall not as good.
-
-        Returns
-        -------
-        float
-            Score assigned by the model.
-        """
-        # checking the input
-        if user in self._user_orig_to_int:
-            userId=self._user_orig_to_int[user]
-        else:
-            raise ValueError('Invalid User')
-            
-        if item in self._item_orig_to_int:
-            itemId=self._item_orig_to_int[item]
-        else:
-            raise ValueError('Invalid Item')
-        
-        # putting the rating history in teh required format
-        if type(rating_history)==list:
-            if rating_history<2:
-                return [self._item_int_to_orig[i] for i in self._item_bias.nlargest(n).index]
-            rating_norm=len(rating_history)**self._norm_nratings
-            ratings=pd.DataFrame([(i[0],i[1]) for i in rating_history],columns=['ItemId','Rating'])
-        elif type(rating_history)==dict:
-            ratings=pd.DataFrame.from_dict(rating_history,orient='index').reset_index().rename(columns={'index':'ItemId',0:'Rating'})
-            rating_norm=rating_history.shape[0]**self._norm_nratings
-        elif type(rating_history)==pd.core.frame.DataFrame:
-            ratings=rating_history[['ItemId','Rating']]
-            rating_norm=rating_history.shape[0]**self._norm_nratings
-        else:
-            raise ValueError("Ratings must be a list of tuples or pandas data frame")
-        
-        # reindexing items
-        ratings['ItemId']=ratings.ItemId.map(lambda x: self._item_orig_to_int[x] if x in self._item_orig_to_int else np.nan)
-        ratings=ratings.loc[~ratings.ItemId.isnull()].sort_values('ItemId')
-        rated_items=list(ratings.ItemId)
-        if len(rated_items)<2:
-            warnings.warn('Fewer than two of the items rated had parameters in the model.')
-            return self._item_bias[self._item_int_to_orig[itemId]]
-        
-        # calculating the score
-        if self._use_biases:
-            if user==None:
-                user_bias=np.mean(ratings.Rating-self._global_bias)
-            else:
-                user_bias=self._user_bias[self._user_orig_to_int[user]]
-                
-            deviations=ratings.apply(lambda x: x['Rating']-self._global_bias-user_bias-self._item_bias[x['ItemId']],axis=1)
-            if use_item_bias:
-                item_bias=self._item_bias[itemId]
-            else:
-                item_bias=0
-            return item_bias+rating_norm*np.sum(self._item_interactions[itemId,rated_items]*deviations.values.reshape(1,-1))+rating_norm*np.sum(self._item_interactions_passive[itemId,rated_items])
-            
-        else:
-            user_bias=ratings.Rating.mean()
-            deviations=ratings['Rating']-user_bias
-            return rating_norm*np.sum(self._item_interactions[itemId,rated_items]*deviations.values.reshape(1,-1))+rating_norm*np.sum(self._item_interactions_passive[itemId,rated_items])
-            
-    
-    def predict_list(self,combinations):
-        """Predict the ratings for a list of user and item combinations.
-
-        Note
-        ----
-        Function only available if the ratings were saved into the model.
-
-        Parameters
-        ----------
-        combinations: data frame or list of tuples
-            If a data frame is passed, it must contain the columns 'UserId' and 'ItemId'.
-            If a list of tuples is passed, tuples must be in the format (UserId,ItemId).
-
-        Returns
-        -------
-        list
-            Predicted ratings for the input list of combinations of users and items.
-        """
-        # checking if the model had saved the ratings
-        try:
-            temp=self._ratings_df.Rating.loc[0]
-        except:
-            raise ValueError("'predict_list' only available when the ratings are saved in the model")
-            
-        # putting the input in the necessary form
-        if type(combinations)==list:
-            df=pd.DataFrame(combinations,columns=['UserId','ItemId'])
-            df['UserId']=df.UserId.map(lambda x: self._user_orig_to_int[x])
-            df['ItemId']=df.ItemId.map(lambda x: self._item_orig_to_int[x])
-        elif type(combinations)==pd.core.frame.DataFrame:
-            df=combinations[['UserId','ItemId']]
-        else:
-            raise ValueError('Input must be a list of tuples or a data frame')
-        
-        try:
-            df['UserId']=df.UserId.map(lambda x: self._user_orig_to_int[x])
-            df['ItemId']=df.ItemId.map(lambda x: self._item_orig_to_int[x])
-        except:
-            raise ValueError('One or more of the users and/or items in the list was not present in the training data.')
-        
-        # predicting the ratings
-        df['PredictedRating']=self._global_bias+df.apply(lambda x: self._user_bias[x['UserId']]+self._item_bias[x['ItemId']],axis=1)
-        df['PredictedRating']+=df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions_passive[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]),axis=1)
-        df['PredictedRating']+=df.apply(lambda x: self._rating_norm_per_user[x['UserId']]*np.sum(self._item_interactions[int(x['ItemId']),self._items_rated_per_user[x['UserId']]]*self._ratings_df.dev.loc[self._indexes_per_user[x['UserId']]]),axis=1)
-        
-        return list(df.PredictedRating)
-    
-    def top_n_saved(self, user, n, use_item_bias=True, scores=False):
-        """Get Top-N recommended items for a user, using the saved ratings to speed up computations.
-
-        Note
-        ----
-        Function only available if the ratings were saved into the model.
-        
-        Parameters
-        ----------
-        user
-            User for which to get recommended list.
-        n: int
-            Number of items to recommend.
-        use_item_bias: bool
-            Whether to include the item bias (favoring overall better-rated items) when predicting ratings.
-            Recommendations that don't take this into account are more diverse and more customized for each user,
-            but overall not as good.
-        scores: bool
-            Whether to include model scores into the output, or only IDs
-
-        Returns
-        -------
-        list
-            Top-N recommended items for the user.
-            If 'scores=True', list of tuples containing (Item,Score)
-        """
-        # checking the input
-        if user not in self._user_orig_to_int:
-            raise ValueError('Invalid User')
-        try:
-            temp=self._ratings_df.Rating.loc[0]
-        except:
-            raise ValueError("'top_n_saved' only available when the ratings are saved in the model")
-        
-        # scoring the items
-        userId=self._user_orig_to_int[user]
-        if self._use_biases and use_item_bias:
-            items=self._item_bias+self._rating_norm_per_user[userId]*np.sum(self._item_interactions[:,self._items_rated_per_user[userId]]*self._ratings_df.dev.loc[self._indexes_per_user[userId]].values.reshape(1,-1))+self._rating_norm_per_user[userId]*np.sum(self._item_interactions_passive[:,self._items_rated_per_user[userId]])
-        else:
-            items=pd.Series([0.0]*self.nitems)+self._rating_norm_per_user[userId]*np.sum(self._item_interactions[:,self._items_rated_per_user[userId]]*self._ratings_df.dev.loc[self._indexes_per_user[userId]].values.reshape(1,-1))+self._rating_norm_per_user[userId]*np.sum(self._item_interactions_passive[:,self._items_rated_per_user[userId]])
-        
-        # returning the items with highest scores
-        already_rated=set(self._items_rated_per_user[userId])
-        recc_items=list()
-        if not scores:
-            items=list(items.sort_values(ascending=False).index)
-            for i in items:
-                if i not in already_rated:
-                    recc_items.append(self._item_int_to_orig[i])
-                    if len(recc_items)>=n:
-                        break
-        else:
-            items=items.sort_values(ascending=False)
-            for i in items.iteritems():
-                if i[0] not in already_rated:
-                    recc_items.append((self._item_int_to_orig[i[0]],i[1]))
-                    if len(recc_items)>=n:
-                        break
-        
-        return recc_items
-    
-    def top_n(self, rating_history, n, user=None, use_item_bias=True, scores=False):
-        """Get Top-N recommended items for a user from its rating history.
-
-        Note
-        ----
-        If the user is new, will try to estimate user bias as:
-            est_user_bias=mean(ratings-global_bias)
-        If the step size for biases was set to zero, this is the same bias that was used to train the model.
-        Can also produce a non-personalized most popular item list if called with an empty rating list, e.g.:
-            top_n([]n=10,user=None)
-        
-        Parameters
-        ----------
-        rating_history: list of tuples, dict, or data frame
-            Rating history of the user.
-            If a list, must contain tuples in the format (ItemId,Rating).
-            If a dict, must contain entries in the format {ItemId:Rating}.
-            If a data frame, must contain columns 'ItemId','Rating'.
-            If passing an empty list or only 1 element, will recommend the most popular items.
-            Ratings for items that were not in the training set will be ignored.
-        n: int
-            Number of items to recommend.
-        user
-            User for which to make recommendations. If None, assumes a new user.
-            If the user is not new and the model included biases, it will look up the bias for that user.
-            Otherwise, it will estimate it from the rating history provided using a heuristic.
-        use_item_bias: bool
-            Whether to include the item bias (favoring overall better-rated items) when predicting ratings.
-            Recommendations that don't take this into account are more diverse and more customized for each user,
-            but overall not as good.
-        scores: bool
-            Whether to include model scores into the output, or only Item IDs
-
-        Returns
-        -------
-        list
-            Top-N recommended items for the user.
-            If 'scores=True', list of tuples containing (Item,Score)
-        """
+    def _process_data(self, ratings_df):
         # checking input
-        if type(rating_history)==list:
-            if len(rating_history)<2:
-                if self._use_biases:
-                    return [self._item_int_to_orig[i] for i in self._item_bias.nlargest(n).index]
-                else:
-                    raise ValueError("Too few ratings. Recommendations by item popularity only available when using item biases")
-            rating_norm=len(rating_history)**self._norm_nratings
-            ratings=pd.DataFrame([(i[0],i[1]) for i in rating_history],columns=['ItemId','Rating'])
-        elif type(rating_history)==dict:
-            ratings=pd.DataFrame.from_dict(rating_history,orient='index').reset_index().rename(columns={'index':'ItemId',0:'Rating'})
-            rating_norm=rating_history.shape[0]**self._norm_nratings
-        elif type(rating_history)==pd.core.frame.DataFrame:
-            ratings=rating_history[['ItemId','Rating']]
-            rating_norm=rating_history.shape[0]**self._norm_nratings
-        else:
-            raise ValueError("Ratings must be a list of tuples or pandas data frame")
+        if isinstance(ratings_df, np.ndarray):
+            assert len(ratings_df.shape) > 1
+            assert ratings_df.shape[1] >= 3
+            ratings_df = ratings_df.as_matrix()[:,:3]
+            ratings_df.columns = ['Rating', 'UserId', 'ItemId']
         
-        # reindexing items
-        ratings['ItemId']=ratings.ItemId.map(lambda x: self._item_orig_to_int[x] if x in self._item_orig_to_int else np.nan)
-        ratings=ratings.loc[~ratings.ItemId.isnull()].sort_values('ItemId')
-        rated_items=list(ratings.ItemId)
-        if len(rated_items)<2:
-            if self._use_biases:
-                warnings.warn('Fewer than two of the items rated had parameters in the model. Recommending most popular items.')
-                return [self._item_int_to_orig[i] for i in self._item_bias.nlargest(n).index]
-            else:
-                raise ValueError("Fewer than two of the items rated had parameters in the model. Recommendations by item popularity only available when using item biases")
-        
-        # getting bias when applicable
-        if user==None:
-            user_bias=np.mean(ratings.Rating-self._global_bias)
+        if ratings_df.__class__.__name__ == 'DataFrame':
+            assert ratings_df.shape[0] > 0
+            assert 'Rating' in ratings_df.columns.values
+            assert 'UserId' in ratings_df.columns.values
+            assert 'ItemId' in ratings_df.columns.values
+            ratings_df = ratings_df[['Rating', 'UserId', 'ItemId']]
         else:
-            user_bias=self._user_bias[self._user_orig_to_int[user]]
+            raise ValueError("'ratings_df' must be a data frame or a numpy array")
+        
+        # reindexing users and items
+        self.user_dict = dict()
+        self.item_dict = dict()
+        cnt_user = 0
+        cnt_item = 0
+        for i in ratings_df.itertuples():
+            if i.UserId not in self.user_dict:
+                self.user_dict[i.UserId] = cnt_user
+                cnt_user += 1
+            if i.ItemId not in self.item_dict:
+                self.item_dict[i.ItemId] = cnt_item
+                cnt_item += 1
+        self._item_mapping = pd.DataFrame([(k,v) for k,v in self.item_dict.items()])
+        self._item_mapping.rename(columns={0:'origId', 1:'newId'}, inplace=True)
+        self._item_mapping.sort_values('newId', inplace=True)
+        self._item_mapping = self._item_mapping.origId.as_matrix()
+        
+        ratings_df['UserId'] = ratings_df.UserId.map(lambda x: self.user_dict[x])
+        ratings_df['ItemId'] = ratings_df.ItemId.map(lambda x: self.item_dict[x])
+        ratings_df.sort_values(['UserId','ItemId'], inplace = True)
+        ratings_df.reset_index(drop = True, inplace = True)
+        
+        ratings_df['Rating'] = ratings_df.Rating.astype('float64')
+        ratings_df['UserId'] = ratings_df.UserId.astype('int64')
+        ratings_df['ItemId'] = ratings_df.ItemId.astype('int64')
+        
+        self.nusers = cnt_user
+        self.nitems = cnt_item
+        
+        # other data needed for fitting
+        self._n_rated_by_user = ratings_df.groupby('UserId')['ItemId'].agg(lambda x: len(x)).as_matrix()
+        self._st_ix_user = np.cumsum(self._n_rated_by_user)
+        self._st_ix_user = np.r_[[0], self._st_ix_user[:self._st_ix_user.shape[0]-1]]
+        
+        self._traindata = ratings_df.copy()
+        return None
+    
+    def _calculate_initial_params(self):
+        if self.center_ratings:
+            self.global_mean = self._traindata.Rating.mean()
+        else:
+            self.global_mean = 0
+        self._traindata['Rating_centered']=self._traindata.Rating - self.global_mean
+        
+        self.bias_item_fixed = self._traindata.groupby('ItemId')['Rating_centered'].agg(['sum','count'])\
+            .apply(lambda x: x['sum']/(x['count'] + self.lambda_bi), axis=1)\
+            .to_frame().rename(columns={0:'item_bias'})
+        self._traindata = pd.merge(self._traindata, self.bias_item_fixed, left_on='ItemId', right_index=True)
+        self._traindata.loc[:, 'Rating_centered_item'] = self._traindata.Rating_centered - self._traindata.item_bias
+        self.bias_user_fixed = self._traindata.groupby('UserId')['Rating_centered_item'].mean()
+        
+        self.bias_user_fixed = self.bias_user_fixed.as_matrix().reshape(-1)
+        self.bias_item_fixed = self.bias_item_fixed.as_matrix().reshape(-1)
+        
+        self._traindata.loc[:, 'Rating_centered_item_and_user'] = self._traindata.Rating_centered \
+                            -self.bias_item_fixed[self._traindata.ItemId].reshape(-1)\
+                            -self.bias_user_fixed[self._traindata.UserId].reshape(-1)
+                
+        del self._traindata['Rating']
+        del self._traindata['Rating_centered_item']
+        
+        return None
+    
+    def _fit_sgd(self, step_size, epochs, decrease_step, early_stop, random_seed, verbose):
+        self.W_ = np.zeros(self.nitems**2, dtype='float64')
+        self.C_ = np.zeros(self.nitems**2, dtype='float64')
+        self.bu_ = self.bias_user_fixed.astype('float64').copy()
+        self.bi_ = self.bias_item_fixed.astype('float64').copy()
+        
+        if random_seed is None:
+            rnd_seed = 0
+            use_seed = 0
+        else:
+            use_seed = 1
+            rnd_seed = random_seed
 
-        # scoring the items
-        if self._use_biases:
-            deviations=ratings.apply(lambda x: x['Rating']-self._global_bias-user_bias-self._item_bias[x['ItemId']],axis=1)
-            item_biases=self._item_bias
-        else:
-            deviations=ratings.Rating-user_bias
-            item_biases=pd.Series([0.0]*self.nitems)
-        items=item_biases+rating_norm*np.sum(self._item_interactions[:,rated_items]*deviations.values.reshape(1,-1),axis=1)+rating_norm*np.sum(self._item_interactions_passive[:,rated_items],axis=1)
+        cython_loops.optimize_sgd(
+            self._traindata.Rating_centered_item_and_user.values,
+            self._traindata.Rating_centered.values,
+            self._traindata.UserId.values,
+            self._traindata.ItemId.values,
+            self._n_rated_by_user,
+            self._st_ix_user,
+            self._traindata.shape[0], self.nusers, self.nitems,
+            self.W_, self.C_, self.bu_, self.bi_,
+            self.alpha, self.lambda_u, self.lambda_i,
+            self.lambda_W, self.lambda_C, step_size,
+            epochs, decrease_step, early_stop, verbose,
+            rnd_seed, use_seed
+        )
+    
+    def _fit_lbfgs(self, opts, verbose):
+        x0 = np.r_[np.zeros(self.nitems**2 ,dtype='float64'),
+                   np.zeros(self.nitems**2 ,dtype='float64'),
+                   self.bias_user_fixed.astype('float64').copy(),
+                   self.bias_item_fixed.astype('float64').copy()]
         
-        # returning the items with highest scores
-        already_rated=set(rated_items)
-        recc_items=list()
-        if not scores:
-            items=list(items.sort_values(ascending=False).index)
-            for i in items:
-                if i not in already_rated:
-                    recc_items.append(self._item_int_to_orig[i])
-                    if len(recc_items)>=n:
-                        break
-        else:
-            items=items.sort_values(ascending=False)
-            for i in items.iteritems():
-                if i[0] not in already_rated:
-                    recc_items.append((self._item_int_to_orig[i[0]],i[1]))
-                    if len(recc_items)>=n:
-                        break
+        fun_args = (
+            self._traindata.Rating_centered.values,
+            self._traindata.Rating_centered_item_and_user.values,
+            self._traindata.UserId.values, self._traindata.ItemId.values,
+            self._n_rated_by_user,
+            self._st_ix_user,
+            self._traindata.shape[0], self.nusers, self.nitems,
+            self.alpha,
+            self.lambda_u, self.lambda_i,
+            self.lambda_W, self.lambda_C
+        )
         
-        return recc_items
+        # diagonals for W and C should be zero
+        con = np.repeat(None, 2*x0.shape[0]).reshape((x0.shape[0], 2))
+        con[np.arange(self.nitems) * (self.nitems+1), :] = 0
+        con[2 * np.arange(self.nitems) * (self.nitems+1), :] = 0
+            
+        opts_dct = dict()
+        if verbose:
+            opts_dct['disp'] = True
+            opts_dct['iprint'] = 1
+        if opts is not None:
+            opts_dct.update(opts)
+        
+        res = minimize(
+             fun = cython_loops.calc_obj,
+             x0 = x0,
+             args = fun_args,
+             method = 'L-BFGS-B',
+             jac = cython_loops.calc_gradient,
+             bounds = con,
+             options = opts_dct
+        )
+        
+        if not res['success']:
+            warnings.warn('Optimization did not converge - model might not perform well')
+        
+        self.W_ = res['x'][:self.nitems**2].copy()
+        self.C_ = res['x'][self.nitems**2:2*(self.nitems**2)].copy()
+        self.bu_ = res['x'][2*(self.nitems**2):2*(self.nitems**2)+self.nusers].copy()
+        self.bi_ = res['x'][2*(self.nitems**2)+self.nusers:].copy()
+
+        del res
+        del con
+    
+    def topN(self, ratings=None, items=None, n=10, uid=None):
+        """
+        Get Top-N highest-rated predictions according to the model
+
+        Note
+        ----
+        This recomended list will filter-out items that were already rated.
+        If saving the training data on the object, can also make predictions
+        for users from the training data without having to provide their
+        rating history again.
+
+        Parameters
+        ----------
+        ratings : array-like
+            Ratings used to make recomendations (ignored when passing uid)
+        items : array-like
+            Items that were rated (ignored when passing uid)
+        n : int
+            How many items to output
+        uid : obj
+            User from the training data for which to make recomendations
+
+        Returns
+        -------
+        top-N : array (n,)
+            Items not rated by the user, order from highest to lowest predicted rating
+        """
+        assert self.is_fitted
+        
+        ## case 1: predicting for a known user
+        if uid is not None:
+            assert self.save_data
+            assert uid in self.user_dict
+            uid = self.user_dict[uid]
+            pred = np.zeros(self.nitems, dtype='float64')
+            cython_loops.recommend_all_known_user(
+                pred,
+                self.W_, self.C_, self.bu_, self.bi_,
+                self._traindata.Rating_centered_item_and_user.values,
+                self._traindata.ItemId.values,
+                self._n_rated_by_user,
+                self._st_ix_user,
+                self.nitems, uid, self.alpha
+            )
+            
+        ## case 2: predicting for an unknown user
+        else: 
+            if isinstance(ratings, list) or isinstance(ratings, tuple):
+                ratings = np.array(ratings)
+            if isinstance(items, list) or isinstance(items, tuple):
+                items = np.array(items)
+                
+                
+            if isinstance(ratings, np.ndarray) or ratings.__class__.__name__=='Series':
+                if ratings.__class__.__name__=='Series':
+                    ratings = ratings.values
+                if len(ratings.shape) > 1:
+                    ratings = ratings.reshape(-1)
+                assert ratings.shape[0] > 0
+            else:
+                raise ValueError("'ratings' and 'items' must be numpy arrays or pandas series")
+                
+            if isinstance(items, np.ndarray) or items.__class__.__name__=='Series':
+                if items.__class__.__name__=='Series':
+                    items = items.values
+                if len(items.shape) > 1:
+                    items = items.reshape(-1)
+                assert items.shape[0] > 0
+            else:
+                raise ValueError("'ratings' and 'items' must be numpy arrays or pandas series")
+                
+            assert ratings.shape[0] == items.shape[0]
+            
+            n_thisuser = items.shape[0]
+            iid = np.array([self.item_dict[i] for i in items if i in self.item_dict])
+            if iid.shape[0] == 0:
+                raise ValueError("None of the items rated were in the training set")
+            Rd = ratings - self.global_mean - self.bias_item_fixed[iid]
+            ## user bias has to be calculated on-the-fly
+            bias_thisuser = Rd.sum()/(n_thisuser + self.lambda_bu)
+            Rd = Rd - bias_thisuser
+            
+            pred = np.zeros(self.nitems, dtype='float64')
+            cython_loops.recommend_from_ratings(
+                pred,
+                self.W_, self.C_, self.bi_,
+                Rd,
+                iid,
+                n_thisuser,
+                self.nitems,
+                self.alpha
+            )
+            
+        ## sorting predictions from better to worse
+        reclist = np.argsort(pred)
+        
+        ## eliminating already rated items
+        chosen = list()
+        if uid is None:
+            set_rated = set(iid)
+        else:
+            st = self._st_ix_user[uid]
+            end = st + self._n_rated_by_user[uid]
+            set_rated = set(self._traindata.ItemId.values[st:end])
+
+        for i in reclist:
+            if i not in set_rated:
+                chosen.append(i)
+            if len(chosen) >= n:
+                break
+        
+        ## outputting items in their original IDs
+        return self._item_mapping[np.array(chosen)]
+            
+    
+    def predict(self, uids, iids):
+        """
+        Predict ratings for a given list of combinations of users and items
+
+        Note
+        ----
+        Can only make predictions for users and items that were in the training data.
+        Required saving the data in the model object (see parameter in the `fit` method)
+
+        Parameters
+        ----------
+        uids : array-like
+            User IDs for which to make prediction of each item
+        iids: array-like
+            Item IDs for which to make predictions
+
+        Returns
+        -------
+        pred : array (n_iids,)
+            Predicted ratings for the combinations of users and items in the input
+        """
+        assert self.is_fitted
+        assert self.save_data
+        
+        ## determining whether to predict one or multiple ratings
+        if isinstance(uids, list) or isinstance(uids, tuple):
+            uids = np.array(uids)
+        if isinstance(iids, list) or isinstance(iids, tuple):
+            iids = np.array(iids)
+            
+        if isinstance(uids, np.ndarray) or uids.__class__.__name__=='Series':
+            if uids.__class__.__name__=='Series':
+                uids = uids.values
+            if iids.__class__.__name__=='Series':
+                iids = iids.values
+                
+            if len(uids.shape) > 1:
+                uids = uids.reshape(-1)
+            if len(iids.shape) > 1:
+                iids = iids.reshape(-1)
+            assert uids.shape[0] == iids.shape[0]
+                
+            if uids.shape[0] == 1:
+                multiple = False
+                uid = uids[0]
+                iid = iids[0]
+            elif uids.shape[0] > 1:
+                multiple = True
+            else:
+                raise ValueError("Invalid input - pass an array of user and item IDs")
+                
+        else:
+            multiple = False
+                
+        ## case 1: predicting a list of ratings
+        if multiple:
+            try:
+                uid = pd.Series(uids).map(lambda x: self.user_dict[x]).as_matrix()
+            except:
+                raise ValueError("Can only predict for users who were in the training data")
+            
+            try:
+                iid = pd.Series(iids).map(lambda x: self.item_dict[x]).as_matrix()
+            except:
+                raise ValueError("Can only predict for items which were in the training data")
+                
+            pred = np.zeros(iid.shape[0], dtype='float64')
+            cython_loops.predict_test_set(
+                self.W_, self.C_, self.bu_, self.bi_,
+                self._traindata.Rating_centered_item_and_user.values,
+                self._traindata.ItemId.values,
+                self._n_rated_by_user,
+                self._st_ix_user,
+                pred,
+                uid, iid,
+                uids.shape[0], self.nitems, self.alpha
+            )
+            return pred + self.global_mean
+        
+        ## case 2: predicting a single rating
+        else:
+            assert uid in self.user_dict
+            assert iid in self.item_dict
+
+            uid = self.user_dict[uid]
+            iid = self.item_dict[iid]
+
+            return cython_loops.predict_single_known_user(
+                self.W_, self.C_, self.bu_, self.bi_,
+                self._traindata.Rating_centered_item_and_user.values,
+                self._traindata.ItemId.values,
+                self._st_ix_user,
+                self._n_rated_by_user,
+                self.nitems, uid, iid, self.alpha
+            )  + self.global_mean
