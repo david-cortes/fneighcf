@@ -4,7 +4,7 @@ cimport numpy as np
 from cpython cimport array
 import array
 cimport cython
-from cython.parallel cimport prange
+from cython.parallel import prange
 
 import warnings
 
