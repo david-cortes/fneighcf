@@ -19,6 +19,8 @@ While rating predictions from this model usually don't achieve as low RMSE as th
 
 Making recomendations from this parameterized model in larger datasets is a lot faster than user-user or item-item similarity or weighted nearest neighbors (and better quality), albeit not as fast as low-rank matrix factorization models.
 
+Note that, if the user bias is eliminated from the formula, the problem becomes a series of separate linear regressions (one for each item), trying to predict the centered rating for each rating using as covariates the centered ratings for each other item plus indicator columns for whether each other item was rated (each user who rated a movie is an observation for the model that predicts that movie). This almost equivalent formulation is massively parallelizable and can be fit with standard packages such as scikit-learn.
+
 ## Instalation
 
 Package is available on PyPI, can be installed with
