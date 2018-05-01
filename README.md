@@ -25,6 +25,11 @@ Package is available on PyPI, can be installed with
 
 ```pip install fneighcf```
 
+As it contains Cython code, it requires a C compiler. In Windows, this usually means it requires a Visual Studio installation, and if using Anaconda, also requires configuring it to use said Visual Studio instead of MinGW, otherwise the installation from `pip` will fail. For more details see this guide:
+[Cython Extensions On Windows](https://github.com/cython/cython/wiki/CythonExtensionsOnWindows)
+
+On Linux and Max, the `pip` install should work out-of-the-box, as long as the system has `gcc` (included by default in most installs).
+
 ## Usage
 
 ``` python
