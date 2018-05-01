@@ -13,7 +13,7 @@ setup(
    'scipy',
    'cython'
 ],
-  version = '0.2',
+  version = '0.2.1',
   description = 'Recommender system based on parameterized Item-Item effects',
   author = 'David Cortes',
   author_email = 'david.cortes.rivera@gmail.com',
@@ -23,8 +23,8 @@ setup(
   classifiers = [],
 
   cmdclass = {'build_ext': build_ext},
-  ext_modules = [Extension("cython_loops",
-                             sources=["cython_loops.pyx"],
+  ext_modules = [Extension("fneighcf.cython_loops",
+                             sources=["fneighcf/cython_loops.pyx"],
                              include_dirs=[numpy.get_include()]),
     ]
 )

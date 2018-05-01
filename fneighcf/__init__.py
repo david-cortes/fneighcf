@@ -1,4 +1,4 @@
-import cython_loops, numpy as np, pandas as pd
+import fneighcf.cython_loops as cython_loops, numpy as np, pandas as pd
 from scipy.optimize import minimize
 import warnings
 

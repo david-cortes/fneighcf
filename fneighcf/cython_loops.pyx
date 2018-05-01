@@ -4,6 +4,7 @@ cimport numpy as np
 from cpython cimport array
 import array
 cimport cython
+from cython.parallel cimport prange
 
 import warnings
 
@@ -77,7 +78,7 @@ cdef double main_c_loop(
 		if update_grad == 1:
 			grad_bu[uid] += step_size * (err - lam3*b_user)
 			grad_bi[iid] += step_size * (err - lam4*b_item)
-			for j in range(n_thisuser):
+			for j in prange(n_thisuser, nogil=True):
 				iid_j = st_ix_imat + ix_i[st_ix + j]
 				# Diagonals should be zero
 				if iid_j != iid*(nI + 1):
