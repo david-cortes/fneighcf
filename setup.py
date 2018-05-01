@@ -18,7 +18,7 @@ setup(
   author = 'David Cortes',
   author_email = 'david.cortes.rivera@gmail.com',
   url = 'https://github.com/david-cortes/fneighcf',
-  download_url = 'https://github.com/david-cortes/fneighcf/archive/0.2.tar.gz',
+  download_url = 'https://github.com/david-cortes/fneighcf/archive/0.2.1.tar.gz',
   keywords = ['collaborative filtering', 'item-item similarity', 'factored neighborhood'],
   classifiers = [],
 
