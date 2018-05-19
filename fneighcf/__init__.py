@@ -1,6 +1,6 @@
-import fneighcf.cython_loops as cython_loops, numpy as np, pandas as pd
+import cython_loops, numpy as np, pandas as pd
 from scipy.optimize import minimize
-import warnings
+import warnings, os
 
 class FNeigh:
     """
@@ -11,6 +11,10 @@ class FNeigh:
     This package only supports the full model version, with all possible
     item-item effects and full square matrices rather than smaller latent
     factor triplets.
+    It can be run in multi-thread mode when fitting with methodd L-BFGS,
+    but it will only use multithreading for calculating the objective and gradient,
+    as the L-BFGS algorithm used is itself single threaded, so the speed up is
+    not big.
 
     Parameters
     ----------
@@ -30,6 +34,11 @@ class FNeigh:
         Regularization for the item-item effects on rating deviations
     lambda_C : float
         Regularization for the implicit item-item effects
+    max_threads : int
+        Maximum number of processor threads to use.
+        If set to -1, will use the maximum available number of cores in the computer being run.
+        If fitting with method SGD, will use only one for fitting, but will
+        still use more for prediction.
 
     Attributes
     ----------
@@ -57,7 +66,7 @@ class FNeigh:
     * Factor in the neighbors: Scalable and accurate collaborative filtering (Koren, Y. 2010)
     """
     def __init__(self, center_ratings=True, alpha=0.5, lambda_bu=10, lambda_bi=25,
-                 lambda_u=5e-1, lambda_i=5e-2, lambda_W=5e-3, lambda_C=5e-2):
+                 lambda_u=5e-1, lambda_i=5e-2, lambda_W=5e-3, lambda_C=5e-2, max_threads=-1):
         
         ## checking input
         assert (isinstance(alpha, float) or isinstance(alpha, int))
@@ -68,6 +77,7 @@ class FNeigh:
         assert isinstance(lambda_W, float)
         assert isinstance(lambda_C, float)
         assert isinstance(center_ratings, bool)
+        assert isinstance(max_threads, int)
         
         ## remembering parameters
         self.center_ratings = center_ratings
@@ -92,6 +102,22 @@ class FNeigh:
         self.bi_ = None
         self.bias_item_fixed = None
         self.bias_user_fixed = None
+
+        ## module was made in linux, assuming np.int64 and int are C_long
+        ## in windows, this is not the case, so I'll cast all int variables
+        try:
+            test_long(np.arange(10))
+            self._cast_long = False
+        except:
+            self._cast_long = True
+
+        if max_threads == -1:
+            max_threads = os.cpu_count()
+            if max_threads is None:
+                max_threads = 1
+        if self._cast_long:
+            max_threads = cython_loops.cast_py(max_threads)
+        self.max_threads = max_threads
     
     def fit(self, ratings_df, method='lbfgs', opts_lbfgs={'maxiter':300},
             epochs=100, step_size=5e-3, decrease_step=True, early_stop=True, random_seed=None,
@@ -224,7 +250,7 @@ class FNeigh:
         self._item_mapping = pd.DataFrame([(k,v) for k,v in self.item_dict.items()])
         self._item_mapping.rename(columns={0:'origId', 1:'newId'}, inplace=True)
         self._item_mapping.sort_values('newId', inplace=True)
-        self._item_mapping = self._item_mapping.origId.as_matrix()
+        self._item_mapping = self._item_mapping.origId.values
         
         ratings_df['UserId'] = ratings_df.UserId.map(lambda x: self.user_dict[x])
         ratings_df['ItemId'] = ratings_df.ItemId.map(lambda x: self.item_dict[x])
@@ -244,6 +270,19 @@ class FNeigh:
         self._st_ix_user = np.r_[[0], self._st_ix_user[:self._st_ix_user.shape[0]-1]]
         
         self._traindata = ratings_df.copy()
+        self._nobs = self._traindata.shape[0]
+
+        if self._cast_long:
+            self._traindata['UserId'] = cython_loops.cast_np(self._traindata.UserId.values)
+            self._traindata['ItemId'] = cython_loops.cast_np(self._traindata.ItemId.values)
+            self._n_rated_by_user = cython_loops.cast_np(self._n_rated_by_user)
+            self._st_ix_user = cython_loops.cast_np(self._st_ix_user)
+            self._nobs = cython_loops.cast_py(self._nobs)
+            self.nusers = cython_loops.cast_py(self.nusers)
+            self.nitems = cython_loops.cast_py(self.nitems)
+            self.user_dict = {k:cython_loops.cast_py(v) for k,v in self.user_dict.items()}
+            self.item_dict = {k:cython_loops.cast_py(v) for k,v in self.item_dict.items()}
+
         return None
     
     def _calculate_initial_params(self):
@@ -285,6 +324,21 @@ class FNeigh:
             use_seed = 1
             rnd_seed = random_seed
 
+        if self._cast_long:
+            self._traindata['UserId'] = cython_loops.cast_np(self._traindata.UserId.values)
+            self._traindata['ItemId'] = cython_loops.cast_np(self._traindata.ItemId.values)
+            self._n_rated_by_user = cython_loops.cast_np(self._n_rated_by_user)
+            self._st_ix_user = cython_loops.cast_np(self._st_ix_user)
+            self._nobs = cython_loops.cast_py(self._nobs)
+            self.nusers = cython_loops.cast_py(self.nusers)
+            self.nitems = cython_loops.cast_py(self.nitems)
+            epochs = cython_loops.cast_py(epochs)
+            decrease_step = cython_loops.cast_py(decrease_step)
+            early_stop = cython_loops.cast_py(early_stop)
+            verbose = cython_loops.cast_py(verbose)
+            rnd_seed = cython_loops.cast_py(rnd_seed)
+            use_seed = cython_loops.cast_py(use_seed)
+
         cython_loops.optimize_sgd(
             self._traindata.Rating_centered_item_and_user.values,
             self._traindata.Rating_centered.values,
@@ -292,7 +346,7 @@ class FNeigh:
             self._traindata.ItemId.values,
             self._n_rated_by_user,
             self._st_ix_user,
-            self._traindata.shape[0], self.nusers, self.nitems,
+            self._nobs, self.nusers, self.nitems,
             self.W_, self.C_, self.bu_, self.bi_,
             self.alpha, self.lambda_u, self.lambda_i,
             self.lambda_W, self.lambda_C, step_size,
@@ -306,16 +360,26 @@ class FNeigh:
                    self.bias_user_fixed.astype('float64').copy(),
                    self.bias_item_fixed.astype('float64').copy()]
         
+        if self._cast_long:
+            self._traindata['UserId'] = cython_loops.cast_np(self._traindata.UserId.values)
+            self._traindata['ItemId'] = cython_loops.cast_np(self._traindata.ItemId.values)
+            self._n_rated_by_user = cython_loops.cast_np(self._n_rated_by_user)
+            self._st_ix_user = cython_loops.cast_np(self._st_ix_user)
+            self._nobs = cython_loops.cast_py(self._nobs)
+            self.nusers = cython_loops.cast_py(self.nusers)
+            self.nitems = cython_loops.cast_py(self.nitems)
+
         fun_args = (
             self._traindata.Rating_centered.values,
             self._traindata.Rating_centered_item_and_user.values,
             self._traindata.UserId.values, self._traindata.ItemId.values,
             self._n_rated_by_user,
             self._st_ix_user,
-            self._traindata.shape[0], self.nusers, self.nitems,
+            self._nobs, self.nusers, self.nitems,
             self.alpha,
             self.lambda_u, self.lambda_i,
-            self.lambda_W, self.lambda_C
+            self.lambda_W, self.lambda_C,
+            self.max_threads
         )
         
         # diagonals for W and C should be zero
@@ -329,7 +393,7 @@ class FNeigh:
             opts_dct['iprint'] = 1
         if opts is not None:
             opts_dct.update(opts)
-        
+
         res = minimize(
              fun = cython_loops.calc_obj,
              x0 = x0,
@@ -393,7 +457,8 @@ class FNeigh:
                 self._traindata.ItemId.values,
                 self._n_rated_by_user,
                 self._st_ix_user,
-                self.nitems, uid, self.alpha
+                self.nitems, uid, self.alpha,
+                self.max_threads
             )
             
         ## case 2: predicting for an unknown user
@@ -425,6 +490,8 @@ class FNeigh:
             assert ratings.shape[0] == items.shape[0]
             
             n_thisuser = items.shape[0]
+            if self._cast_long:
+                n_thisuser = cython_loops.cast_py(n_thisuser)
             iid = np.array([self.item_dict[i] for i in items if i in self.item_dict])
             if iid.shape[0] == 0:
                 raise ValueError("None of the items rated were in the training set")
@@ -441,7 +508,8 @@ class FNeigh:
                 iid,
                 n_thisuser,
                 self.nitems,
-                self.alpha
+                self.alpha,
+                self.max_threads
             )
             
         ## sorting predictions from better to worse
@@ -531,6 +599,10 @@ class FNeigh:
                 iid = pd.Series(iids).map(lambda x: self.item_dict[x]).as_matrix()
             except:
                 raise ValueError("Can only predict for items which were in the training data")
+
+            nuids_pred = uids.shape[0]
+            if self._cast_long:
+                nuids_pred = cython_loops.cast_py(nuids_pred)
                 
             pred = np.zeros(iid.shape[0], dtype='float64')
             cython_loops.predict_test_set(
@@ -541,17 +613,22 @@ class FNeigh:
                 self._st_ix_user,
                 pred,
                 uid, iid,
-                uids.shape[0], self.nitems, self.alpha
+                nuids_pred, self.nitems, self.alpha,
+                self.max_threads
             )
             return pred + self.global_mean
         
         ## case 2: predicting a single rating
         else:
-            assert uid in self.user_dict
-            assert iid in self.item_dict
+            if uids.__class__.__name__=='ndarray':
+                uids = uids[0]
+            if iids.__class__.__name__=='ndarray':
+                iids = iids[0]
+            assert uids in self.user_dict
+            assert iids in self.item_dict
 
-            uid = self.user_dict[uid]
-            iid = self.item_dict[iid]
+            uid = self.user_dict[uids]
+            iid = self.item_dict[iids]
 
             return cython_loops.predict_single_known_user(
                 self.W_, self.C_, self.bu_, self.bi_,

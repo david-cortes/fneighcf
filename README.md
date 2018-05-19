@@ -27,8 +27,10 @@ Package is available on PyPI, can be installed with
 
 ```pip install fneighcf```
 
-As it contains Cython code, it requires a C compiler. In Windows, this usually means it requires a Visual Studio installation, and if using Anaconda, also requires configuring it to use said Visual Studio instead of MinGW, otherwise the installation from `pip` will fail. For more details see this guide:
+As it contains Cython code, it requires a C compiler. In Windows, this usually means it requires a Visual Studio installation (or MinGW + gcc), and if using Anaconda, might also require configuring it to use said Visual Studio instead of MinGW, otherwise the installation from `pip` might fail. For more details see this guide:
 [Cython Extensions On Windows](https://github.com/cython/cython/wiki/CythonExtensionsOnWindows)
+
+On Python 2.7 on Windows, it might additionally requiring installing extra Visual Basic modules.
 
 On Linux and Mac, the `pip` install should work out-of-the-box, as long as the system has `gcc` (included by default in most installs).
 
@@ -71,11 +73,11 @@ The package implements only the full model with all item-item effects considered
 
 All users and items are reindexed internally at fitting time, so you can pass any hashable object (numbers, strings, characters, etc.) as IDs.
 
-The core computations are implemented in fast Cython code, but it is not multi-threaded. The model can be fit using L-BFGS-B, which calculates the full gradient and objective function in order to update the parameters at each iteration, or using SGD (Stochastic Gradient Descent) as described in the paper (see references at the bottom), which iterates through the data updating the parameters right after processing each individual rating.
+The core computations are implemented in fast Cython code. The model can be fit using L-BFGS-B, which calculates the full gradient and objective function in order to update the parameters at each iteration, or using SGD (Stochastic Gradient Descent) as described in the paper (see references at the bottom), which iterates through the data updating the parameters right after processing each individual rating.
 
 SGD has lower memory requirements and is able to achieve a low error in less time, but it likely won't reach the optimal solution and requires tuning the step size and other parameters. This  is likely an appropriate alternative for large datasets.
 
-L-BFGS-B requires more memory, and is slower to converge, but it always reaches the optimal solution and doesn't require playing with parameters like the step size. Recommended for smaller datasets.
+L-BFGS-B requires more memory, and is slower to converge, but it always reaches the optimal solution and doesn't require playing with parameters like the step size. Recommended for smaller datasets. Can use multithreading for calculating the gradient and objective function, but the L-BFGS algorithm used is single-threaded, so the speed-up will not be much.
 
 The package has only been tested under Python 3.
 

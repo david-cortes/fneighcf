@@ -9,6 +9,18 @@ from cython.parallel import prange
 import warnings
 
 ###########################
+### Casting for 'long' dtypes in Windows OS
+
+def test_long(np.ndarray[long, ndim=1] a):
+	return None
+
+def cast_np(a):
+	return a.astype(long)
+
+def cast_py(a):
+	return <long> a
+
+###########################
 ### Function for fitting the model
 
 @cython.boundscheck(False)
@@ -35,6 +47,85 @@ cdef double main_c_loop(
 				long nR, long nI,
 				double step_size,
 				long update_grad,
+				long randomized,
+				long maxthreads
+			   ) nogil:
+	cdef double sumR
+	cdef long st_ix
+	cdef double err
+	cdef double rnorm
+	cdef long iid_j
+	cdef long uid, iid
+	cdef long n_thisuser
+	cdef long st_ix_imat
+	cdef double b_user
+	cdef double b_item
+	cdef double Rj
+	cdef long i, j, r
+
+	cdef double err_tot = 0
+	for r in prange(nR, schedule='static', num_threads=maxthreads):
+		if randomized == 0:
+			i = r
+		else:
+			i = shuffled_ix[r]
+		uid = ix_u[i]
+		iid = ix_i[i]
+		st_ix_imat = nI*iid
+		b_user = bu[uid]
+		b_item = bi[iid]
+		sumR = 0
+
+		st_ix = st_ix_user[uid]
+		n_thisuser = n_rated_by_user[uid]
+		for j in range(n_thisuser):
+			iid_j = st_ix_imat + ix_i[st_ix + j]
+			Rj = Rd[st_ix + j]
+			sumR = sumR + W[iid_j] * Rj
+			sumR = sumR + C[iid_j]
+
+		rnorm = n_thisuser**(-alpha)
+		err = Rc[i] - (b_user + b_item + rnorm * sumR)
+		err_tot += err*err
+
+		if update_grad == 1:
+			grad_bu[uid] += step_size * (err - lam3*b_user)
+			grad_bi[iid] += step_size * (err - lam4*b_item)
+			for j in range(n_thisuser):
+			# for j in prange(n_thisuser, schedule='static', nogil=True):
+				iid_j = st_ix_imat + ix_i[st_ix + j]
+				# Diagonals should be zero
+				if iid_j != iid*(nI + 1):
+					Rj = Rd[st_ix + j]
+					grad_W[iid_j] += step_size * (rnorm * err * Rj - lam1*W[iid_j])
+					grad_C[iid_j] += step_size * (rnorm * err - lam2*C[iid_j])
+
+	return err_tot
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.nonecheck(False)
+@cython.cdivision(True)
+cdef double main_c_loop_single(
+				double* grad_W,
+				double* grad_C,
+				double* grad_bu,
+				double* grad_bi,
+				long* shuffled_ix,
+				double* Rc,
+				double* Rd,
+				long* ix_u,
+				long* ix_i,
+				long* n_rated_by_user,
+				long* st_ix_user,
+				double* W,
+				double* C,
+				double* bu,
+				double* bi,
+				double alpha, double lam1, double lam2, double lam3, double lam4,
+				long nR, long nI,
+				double step_size,
+				long update_grad,
 				long randomized
 			   ):
 	cdef double sumR
@@ -42,13 +133,13 @@ cdef double main_c_loop(
 	cdef double err
 	cdef double rnorm
 	cdef long iid_j
-	cdef long iid
+	cdef long uid, iid
 	cdef long n_thisuser
 	cdef long st_ix_imat
 	cdef double b_user
 	cdef double b_item
 	cdef double Rj
-	cdef long j
+	cdef long i, j, r
 
 	cdef double err_tot = 0
 	for r in range(nR):
@@ -68,8 +159,8 @@ cdef double main_c_loop(
 		for j in range(n_thisuser):
 			iid_j = st_ix_imat + ix_i[st_ix + j]
 			Rj = Rd[st_ix + j]
-			sumR += W[iid_j] * Rj
-			sumR += C[iid_j]
+			sumR = sumR + W[iid_j] * Rj
+			sumR = sumR + C[iid_j]
 
 		rnorm = n_thisuser**(-alpha)
 		err = Rc[i] - (b_user + b_item + rnorm * sumR)
@@ -78,7 +169,8 @@ cdef double main_c_loop(
 		if update_grad == 1:
 			grad_bu[uid] += step_size * (err - lam3*b_user)
 			grad_bi[iid] += step_size * (err - lam4*b_item)
-			for j in prange(n_thisuser, nogil=True):
+			for j in range(n_thisuser):
+			# for j in prange(n_thisuser, schedule='static', nogil=True):
 				iid_j = st_ix_imat + ix_i[st_ix + j]
 				# Diagonals should be zero
 				if iid_j != iid*(nI + 1):
@@ -132,8 +224,9 @@ cdef void predict_all_known_user(
 			long* st_ix_user,
 			long* n_rated_by_user,
 			double* pred_arr,
-			long nI, long uid, double alpha
-			):
+			long nI, long uid, double alpha,
+			long nthreads
+			) nogil:
 
 	cdef long st_ix = st_ix_user[uid]
 	cdef long iid
@@ -142,7 +235,7 @@ cdef void predict_all_known_user(
 	cdef long iid_j
 	cdef long st_ix_imat
 
-	for i in range(nI):
+	for i in prange(nI, schedule='static', num_threads=nthreads):
 		iid = ix_i[st_ix + i]
 		st_ix_imat = iid*nI
 		for j in range(n_rated_by_user[uid]):
@@ -163,14 +256,15 @@ cdef void score_all_from_rating_lst(
 			double* Rd,
 			long* ix_ratings,
 			double* pred_arr,
-			long nI, long n_thisuser, double alpha
-			):
+			long nI, long n_thisuser, double alpha,
+			long nthreads
+			) nogil:
 	
 	cdef long i
 	cdef long j
 	cdef long iid_j
 
-	for i in range(nI):
+	for i in prange(nI, schedule='static', num_threads=nthreads):
 		for j in range(n_thisuser):
 			iid_j = i*nI + ix_ratings[j]
 			pred_arr[i] += C[iid_j] + W[iid_j] * Rd[j]
@@ -195,8 +289,9 @@ cdef void predict_lst(
 		long* pred_iids,
 		long nPredict,
 		long nI,
-		double alpha
-		):
+		double alpha,
+		long nthreads
+		) nogil:
 	
 	cdef long iid
 	cdef long uid
@@ -206,7 +301,7 @@ cdef void predict_lst(
 	cdef long iid_j
 	cdef long st_ix
 
-	for i in range(nPredict):
+	for i in prange(nPredict, schedule='static', num_threads=nthreads):
 		uid = pred_uids[i]
 		iid = pred_iids[i]
 		st_ix = st_ix_user[uid]
@@ -228,7 +323,8 @@ def recommend_from_ratings(
 		np.ndarray[double, ndim=1] bi,
 		np.ndarray[double, ndim=1] Rd,
 		np.ndarray[long, ndim=1] rated_this_user,
-		long n_thisuser, long nI, double alpha
+		long n_thisuser, long nI, double alpha,
+		long nthreads
 	):
 	score_all_from_rating_lst(
 			&W[0],
@@ -237,7 +333,8 @@ def recommend_from_ratings(
 			&Rd[0],
 			&rated_this_user[0],
 			&empty_arr[0],
-			nI, n_thisuser, alpha
+			nI, n_thisuser, alpha,
+			nthreads
 			)
 
 def recommend_all_known_user(
@@ -250,7 +347,8 @@ def recommend_all_known_user(
 	np.ndarray[long, ndim=1] ix_i,
 	np.ndarray[long, ndim=1] n_rated_by_user,
 	np.ndarray[long, ndim=1] st_ix_user,
-	long nI, long uid, double alpha
+	long nI, long uid, double alpha,
+	long nthreads
 	):
 	
 	predict_all_known_user(
@@ -263,7 +361,8 @@ def recommend_all_known_user(
 			&st_ix_user[0],
 			&n_rated_by_user[0],
 			&empty_arr[0],
-			nI, uid, alpha)
+			nI, uid, alpha,
+			nthreads)
 
 def predict_single_known_user(
 	np.ndarray[double, ndim=1] W,
@@ -300,7 +399,8 @@ def predict_test_set(
 		np.ndarray[double, ndim=1] empty_arr,
 		np.ndarray[long, ndim=1] pred_uids,
 		np.ndarray[long, ndim=1] pred_iids,
-		long nPredict, long nI, double alpha):
+		long nPredict, long nI, double alpha,
+		long nthreads):
 	predict_lst(
 		&W[0],
 		&C[0],
@@ -315,7 +415,8 @@ def predict_test_set(
 		&pred_iids[0],
 		nPredict,
 		nI,
-		alpha
+		alpha,
+		nthreads
 	)
 
 ########################################
@@ -336,6 +437,7 @@ def calc_obj(np.ndarray[double, ndim=1] xlong, *args):
 	cdef double lam2 = args[11]
 	cdef double lam3 = args[12]
 	cdef double lam4 = args[13]
+	cdef long nthreads = args[14]
 
 	cdef long st_bu = 0
 	cdef long st_bi = nU
@@ -351,7 +453,8 @@ def calc_obj(np.ndarray[double, ndim=1] xlong, *args):
 				&xlong[st_W], &xlong[st_C], &xlong[st_bu], &xlong[st_bi],
 				alpha, lam1, lam2, lam3, lam4,
 				nR, nI,
-				0.0, 0, 0
+				0.0, 0, 0,
+				nthreads
 			)
 
 	pred_err += lam1 * (np.linalg.norm(xlong[st_bu:st_bi])**2)\
@@ -375,6 +478,7 @@ def calc_gradient(np.ndarray[double, ndim=1] xlong, *args):
 	cdef double lam2 = args[11]
 	cdef double lam3 = args[12]
 	cdef double lam4 = args[13]
+	cdef long nthreads = args[14]
 
 	cdef long st_bu = 0
 	cdef long st_bi = nU
@@ -391,7 +495,8 @@ def calc_gradient(np.ndarray[double, ndim=1] xlong, *args):
 				&xlong[st_W], &xlong[st_C], &xlong[st_bu], &xlong[st_bi],
 				alpha, lam1, lam2, lam3, lam4,
 				nR, nI,
-				-1.0, 1, 0
+				-1.0, 1, 0,
+				nthreads
 			)
 	return grad
 
@@ -425,7 +530,7 @@ def optimize_sgd(
 		if use_seed != 0:
 			np.random.seed(random_seed)
 		np.random.shuffle(shuffled_ix)
-		err_iter = main_c_loop(
+		err_iter = main_c_loop_single(
 				&W[0], &C[0], &bu[0], &bi[0],
 				&shuffled_ix[0],
 				&Rc[0], &Rd[0],
